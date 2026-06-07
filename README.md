@@ -78,9 +78,29 @@ Environment variables:
 |-----|---------|---------|
 | `CC_STATUSLINE_THEME` | `pill` | `pill` = bright neon on a dark background pill (pops on a cream/light terminal); `light` = deep jewel tones, no background; `dark` = neon on the terminal's own dark bg |
 | `CC_BAR_WIDTH` | `12` | bar width in cells |
-| `CC_CACHE_TTL` | `45` | seconds the OAuth-fallback usage stays cached |
+| `CC_CACHE_TTL` | `15` | seconds the shared usage cache stays fresh |
+| `CC_STATUSLINE_COLS` | _(auto)_ | force a pane width instead of auto-detecting (useful for testing compaction) |
 
 The pill background color is `BG_FILL` in the theme block (default `(22,23,30)`).
+
+## Responsive auto-compaction
+
+The line adapts to the pane width. Claude Code doesn't pass the width, so the
+script reads the winsize of the nearest ancestor's controlling tty (the pty it
+runs in, which the terminal resizes on every pane resize). It then picks the
+richest layout `TIER` that fits, shedding detail in priority order so the
+5h/7d percentages always survive:
+
+```
+model name → ctx% → reset countdowns → bars → 5h/7d labels
+```
+
+So a 120-col pane shows everything; a ~14-col sliver shows just `73%  41%`.
+Preview the ladder at any width with `--cols`:
+
+```bash
+python3 statusline.py --demo --pct5 73 --pct7 41 --cols 40
+```
 
 Gradient stops live in `STOPS_LIGHT` / `STOPS_DARK` near the top of the file —
 edit the RGB tuples to recolor.
@@ -88,7 +108,7 @@ edit the RGB tuples to recolor.
 ## Verify / preview
 
 ```bash
-python3 statusline.py --selftest                 # 15 assertions on the math
+python3 statusline.py --selftest                 # assertions: gradient, countdown, compaction
 python3 statusline.py --demo --pct5 95 --pct7 78 # render at chosen utilization
 python3 showcase.py                              # /tmp/showcase.png across the full range
 ```

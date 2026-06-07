@@ -321,6 +321,90 @@ def usage_from_payload(payload):
     return {"five_hour": conv(fh), "seven_day": conv(sd)}
 
 
+_ANSI_RE = None
+
+
+def visible_len(s):
+    """On-screen width of a string: ANSI escapes stripped, chars counted.
+    All glyphs we use (block elements, ◆, ↺, digits) are monospace width 1."""
+    global _ANSI_RE
+    if _ANSI_RE is None:
+        import re
+        _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+    return len(_ANSI_RE.sub("", s))
+
+
+def _ioctl_cols(path):
+    """Columns of a tty device via TIOCGWINSZ; non-blocking open, never hangs."""
+    fd = None
+    try:
+        import fcntl, termios, struct
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        hw = struct.unpack("hhhh", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+        return hw[1] or None
+    except Exception:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def term_cols():
+    """Live width of the pane. Claude Code passes no width, and the status-line
+    process has no tty of its own, so we read the winsize of the nearest
+    ancestor's controlling tty (the pty Claude Code runs in, which cmux resizes
+    on every pane resize). One process-table snapshot is read and walked in
+    memory — a single subprocess, no stale per-pid cache files. Returns None if
+    no ancestor tty is found (caller then renders the full, widest layout)."""
+    env = os.environ.get("CC_STATUSLINE_COLS")
+    if env:
+        try:
+            return int(env)
+        except Exception:
+            pass
+    # Targeted per-pid queries only — `ps -A` (whole table) can take seconds on a
+    # busy machine, whereas `ps -p PID` is ~10ms. Start at the parent (the status
+    # line process itself never owns a tty — stdin/stdout are pipes), so the
+    # common case is a single ps call: parent = Claude Code, which owns the pty.
+    pid = str(os.getppid())
+    for _ in range(12):
+        try:
+            out = subprocess.check_output(
+                ["ps", "-o", "ppid=,tty=", "-p", pid],
+                text=True, stderr=subprocess.DEVNULL).split(None, 1)
+        except Exception:
+            break
+        if not out:
+            break
+        ppid = out[0]
+        tty = out[1].strip() if len(out) > 1 else ""
+        if tty and tty not in ("??", "-", "?"):
+            c = _ioctl_cols("/dev/" + tty)
+            if c:
+                return c
+        if not ppid or ppid in ("0", "1"):
+            break
+        pid = ppid
+    return None
+
+
+def countdown_short(resets_at, now=None):
+    """Ultra-compact reset hint for narrow widths: 5d / 4h / 12m."""
+    cd = countdown(resets_at, now)
+    if not cd or cd == "now":
+        return cd
+    if "d" in cd:
+        return cd.split("d")[0] + "d"
+    # cd is H:MM:SS or MM:SS
+    parts = cd.split(":")
+    if len(parts) == 3:
+        return parts[0] + "h"
+    return parts[0] + "m"
+
+
 def model_chip(payload):
     name = (
         payload.get("model", {}).get("display_name")
@@ -344,34 +428,80 @@ def ctx_chip(payload):
     return fg(SOFT) + "ctx " + RESET + fg(c) + f"{round(used)}%" + RESET
 
 
-def meter(glyph, window):
-    """One labeled gradient meter with countdown."""
+def meter(glyph, window, bar_w=BAR_W, cd_mode="full", show_label=True):
+    """One gradient meter. Parametric so the layout can shed detail under width
+    pressure: bar_w=0 drops the bar, cd_mode in full|short|none, show_label
+    toggles the 5h/7d tag."""
     if not window:
         return None
     pct = window.get("utilization", 0.0)
-    bar = gradient_bar(pct)
-    lbl = pct_label(pct)
-    cd = countdown(window.get("resets_at"))
-    tail = fg(SOFT) + f" ↺{cd}" + RESET if cd else ""
-    return fg(GREY) + glyph + " " + RESET + bar + " " + lbl + tail
+    out = ""
+    if show_label:
+        out += fg(GREY) + glyph + " " + RESET
+    if bar_w > 0:
+        out += gradient_bar(pct, bar_w) + " "
+    out += pct_label(pct)
+    if cd_mode == "full":
+        cd = countdown(window.get("resets_at"))
+    elif cd_mode == "short":
+        cd = countdown_short(window.get("resets_at"))
+    else:
+        cd = ""
+    if cd:
+        out += fg(SOFT) + " ↺" + cd + RESET
+    return out
 
 
-def build_line(payload, usage):
+def render(payload, usage, model="full", ctx=True, bar_w=BAR_W,
+           cd="full", labels=True):
+    """Render one layout variant given the detail flags."""
     sep = fg(SEPC) + "  " + RESET
-    parts = [model_chip(payload)]
-    cc = ctx_chip(payload)
-    if cc:
-        parts.append(cc)
+    parts = []
+    if model == "full":
+        parts.append(model_chip(payload))
+    elif model == "icon":
+        parts.append(fg(ACCENT) + "◆" + RESET)
+    if ctx:
+        cc = ctx_chip(payload)
+        if cc:
+            parts.append(cc)
     if usage:
-        m5 = meter("5h", usage.get("five_hour"))
-        m7 = meter("7d", usage.get("seven_day"))
-        if m5:
-            parts.append(m5)
-        if m7:
-            parts.append(m7)
+        for glyph, key in (("5h", "five_hour"), ("7d", "seven_day")):
+            m = meter(glyph, usage.get(key), bar_w, cd, labels)
+            if m:
+                parts.append(m)
     else:
         parts.append(fg(SOFT) + "limits unavailable" + RESET)
     return with_background(sep.join(parts))
+
+
+# Layout tiers, richest → leanest. The first whose on-screen width fits the
+# pane is used, so detail is shed in priority order (model name → ctx →
+# countdowns → bars → 5h/7d labels) and the percentages survive longest.
+TIERS = [
+    dict(model="full", ctx=True,  bar_w=12, cd="full",  labels=True),
+    dict(model="full", ctx=False, bar_w=12, cd="full",  labels=True),
+    dict(model="icon", ctx=False, bar_w=12, cd="full",  labels=True),
+    dict(model="icon", ctx=False, bar_w=10, cd="short", labels=True),
+    dict(model="none", ctx=False, bar_w=8,  cd="short", labels=True),
+    dict(model="none", ctx=False, bar_w=6,  cd="none",  labels=True),
+    dict(model="none", ctx=False, bar_w=0,  cd="none",  labels=True),
+    dict(model="none", ctx=False, bar_w=0,  cd="none",  labels=False),
+]
+
+
+def build_line(payload, usage, cols=None):
+    """Pick the richest layout tier that fits `cols`. Falls back to full when
+    width is unknown, and to the leanest tier when nothing fits (Claude Code
+    then truncates, but the most important info is leftmost)."""
+    if not cols or cols <= 0:
+        return render(payload, usage, **TIERS[0])
+    budget = cols - 1  # small safety margin against off-by-one truncation
+    for tier in TIERS:
+        line = render(payload, usage, **tier)
+        if visible_len(line) <= budget:
+            return line
+    return render(payload, usage, **TIERS[-1])
 
 
 # ----------------------------------------------------------------------------
@@ -415,7 +545,8 @@ def main():
         }
         payload = {"model": {"display_name": "Opus 4.8"},
                    "context_window": {"used_percentage": 42}}
-        print(build_line(payload, usage))
+        cols = int(argval("--cols", 0)) or None
+        print(build_line(payload, usage, cols))
         return
 
     payload = read_payload()
@@ -423,7 +554,7 @@ def main():
     # Only if the cache is cold do we fall back to the per-session stdin snapshot
     # for the first paint; the background refresh warms the cache within ~1s.
     usage = cached_usage() or usage_from_payload(payload)
-    print(build_line(payload, usage))
+    print(build_line(payload, usage, term_cols()))
 
 
 def run_selftest():
@@ -467,6 +598,29 @@ def run_selftest():
                        "seven_day": {"utilization": 16, "resets_at": "2026-06-13T03:00:00+00:00"}})
     check("line emits truecolor", "\033[38;2;" in line)
     check("line shows reset glyph", "↺" in line)
+
+    # responsive auto-compaction
+    pl = {"model": {"display_name": "Opus 4.8"}, "context_window": {"used_percentage": 42}}
+    us = {"five_hour": {"utilization": 34, "resets_at": "2026-06-07T21:00:00+00:00"},
+          "seven_day": {"utilization": 16, "resets_at": "2026-06-13T03:00:00+00:00"}}
+    check("visible_len strips ANSI", visible_len("\033[38;2;1;2;3mAB\033[0m") == 2)
+    wide = build_line(pl, us, 200)
+    check("wide keeps model name", "Opus 4.8" in wide)
+    # every width from 6..120 must produce a line that fits (or the leanest tier)
+    fits_all = True
+    prev = 0
+    for c in range(120, 5, -1):
+        vl = visible_len(build_line(pl, us, c))
+        if c >= 12 and vl > c - 1 and vl > visible_len(render(pl, us, **TIERS[-1])):
+            fits_all = False
+            break
+    check("every width >=12 fits its budget", fits_all)
+    narrow = build_line(pl, us, 24)
+    check("narrow drops model name", "Opus 4.8" not in narrow)
+    check("narrow still shows a percentage", "%" in narrow)
+    check("wide is wider than narrow", visible_len(wide) > visible_len(narrow))
+    check("monotonic: 40c <= 80c width",
+          visible_len(build_line(pl, us, 40)) <= visible_len(build_line(pl, us, 80)))
 
     print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
     sys.exit(0 if ok else 1)
