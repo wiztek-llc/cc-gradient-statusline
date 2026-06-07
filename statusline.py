@@ -31,8 +31,8 @@ CACHE = os.path.expanduser("~/.cache/cc-gradient-usage.json")
 LOCK = os.path.expanduser("~/.cache/cc-gradient-usage.lock")
 STDIN_LOG = os.path.expanduser("~/.cache/cc-gradient-stdin.json")
 CREDS = os.environ.get("CC_CREDENTIALS", os.path.expanduser("~/.claude/.credentials.json"))
-CACHE_TTL = int(os.environ.get("CC_CACHE_TTL", "45"))   # seconds usage stays fresh
-LOCK_TTL = 25                                            # min seconds between API hits
+CACHE_TTL = int(os.environ.get("CC_CACHE_TTL", "15"))   # seconds usage stays fresh
+LOCK_TTL = 12                                            # min seconds between API hits
 BAR_W = int(os.environ.get("CC_BAR_WIDTH", "12"))       # bar width in cells
 
 # Eighth-block characters for sub-cell fractional fill (smooth bars)
@@ -194,12 +194,14 @@ def countdown(resets_at, now=None):
         return "now"
     d, rem = divmod(secs, 86400)
     h, rem = divmod(rem, 3600)
-    m, _ = divmod(rem, 60)
+    m, s = divmod(rem, 60)
+    # Days away (e.g. the 7d window): coarse, seconds are meaningless.
     if d > 0:
         return f"{d}d{h}h"
+    # Under a day (e.g. the 5h window): a live ticking clock, updates per second.
     if h > 0:
-        return f"{h}h{m:02d}m"
-    return f"{m}m"
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 # ----------------------------------------------------------------------------
@@ -246,58 +248,67 @@ def fetch_usage():
     return None
 
 
-def cached_usage():
-    """Return usage JSON, using a short TTL cache + lock to be fast and polite."""
+def read_cache():
+    try:
+        with open(CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def spawn_refresh():
+    """Kick off a detached background fetch (no waiting) to refresh the shared
+    cache. A lock throttles it so that, across ALL sessions, at most one fetch
+    runs per ~LOCK_TTL — and no status-line render ever blocks on the network."""
     now = time.time()
-    # ensure the cache dir exists (fresh machines may lack ~/.cache)
+    if os.path.isfile(LOCK) and (now - os.path.getmtime(LOCK)) < LOCK_TTL:
+        return  # a refresh started recently (possibly by another session)
     try:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-    except Exception:
-        pass
-    if os.path.isfile(CACHE):
-        age = now - os.path.getmtime(CACHE)
-        if age < CACHE_TTL:
-            try:
-                with open(CACHE) as f:
-                    return json.load(f)
-            except Exception:
-                pass
-    # avoid stampeding the API: if a fetch happened very recently, reuse stale cache
-    if os.path.isfile(LOCK) and (now - os.path.getmtime(LOCK)) < LOCK_TTL:
-        if os.path.isfile(CACHE):
-            try:
-                with open(CACHE) as f:
-                    return json.load(f)
-            except Exception:
-                pass
-    try:
         open(LOCK, "w").close()
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--refresh-usage"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
     except Exception:
         pass
+
+
+def do_refresh():
+    """Background worker: fetch account-global usage and write the shared cache."""
     data = fetch_usage()
     if data:
         try:
+            os.makedirs(os.path.dirname(CACHE), exist_ok=True)
             with open(CACHE, "w") as f:
                 json.dump(data, f)
         except Exception:
             pass
-        return data
-    # fall back to stale cache on failure
+
+
+def cached_usage():
+    """Account-global usage from the shared cache. If the cache is stale, trigger
+    a non-blocking background refresh and return whatever we have right now
+    (slightly stale, or None on a cold machine). Because the cache file is shared
+    across every session, all sessions display the SAME numbers."""
+    data = read_cache()
+    fresh = False
     if os.path.isfile(CACHE):
-        try:
-            with open(CACHE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
+        fresh = (time.time() - os.path.getmtime(CACHE)) < CACHE_TTL
+    if not fresh:
+        spawn_refresh()
+    return data
 
 
 # ----------------------------------------------------------------------------
 # Compose the status line
 # ----------------------------------------------------------------------------
 def usage_from_payload(payload):
-    """Claude Code delivers rate_limits natively in stdin (epoch reset times).
-    Prefer it — instant, no network. Returns the same shape as the OAuth API."""
+    """COLD-START FALLBACK ONLY. Claude Code ships rate_limits in stdin, but that
+    is a per-session snapshot frozen at the session's last API response — so it
+    disagrees across sessions. We only use it for the very first paint before the
+    shared account-global cache is warm; never written to the shared cache."""
     rl = payload.get("rate_limits") or {}
     fh, sd = rl.get("five_hour"), rl.get("seven_day")
     if not fh and not sd:
@@ -389,6 +400,10 @@ def main():
         run_selftest()
         return
 
+    if "--refresh-usage" in args:
+        do_refresh()
+        return
+
     if "--demo" in args:
         def argval(flag, default):
             return float(args[args.index(flag) + 1]) if flag in args else default
@@ -404,9 +419,10 @@ def main():
         return
 
     payload = read_payload()
-    # Prefer the rate_limits Claude Code ships in stdin (instant, offline-safe);
-    # fall back to the OAuth usage endpoint only if the payload lacks them.
-    usage = usage_from_payload(payload) or cached_usage()
+    # Account-global usage from the shared cache (same numbers in every session).
+    # Only if the cache is cold do we fall back to the per-session stdin snapshot
+    # for the first paint; the background refresh warms the cache within ~1s.
+    usage = cached_usage() or usage_from_payload(payload)
     print(build_line(payload, usage))
 
 
@@ -435,10 +451,13 @@ def run_selftest():
     check("50% has ~5 full blocks", fullblocks(50) == 5)
     check("more usage => more fill", fullblocks(80) > fullblocks(30))
 
-    # countdown math
+    # countdown math — sub-day is a live H:MM:SS / MM:SS ticking clock
     now = datetime(2026, 6, 7, 19, 0, 0, tzinfo=timezone.utc)
-    check("2h countdown", countdown("2026-06-07T21:00:00+00:00", now) == "2h00m")
-    check("multiday countdown", countdown("2026-06-13T03:00:00+00:00", now) == "5d8h")
+    check("hours -> H:MM:SS", countdown("2026-06-07T21:03:45+00:00", now) == "2:03:45")
+    check("sub-hour -> MM:SS", countdown("2026-06-07T19:45:30+00:00", now) == "45:30")
+    check("ticks each second", countdown("2026-06-07T21:00:02+00:00", now) == "2:00:02")
+    check("multiday stays coarse", countdown("2026-06-13T03:00:00+00:00", now) == "5d8h")
+    check("epoch input works", countdown(int(now.timestamp()) + 65, now) == "1:05")
     check("past => now", countdown("2026-06-07T18:00:00+00:00", now) == "now")
     check("bad input => empty", countdown("not-a-date", now) == "")
 
