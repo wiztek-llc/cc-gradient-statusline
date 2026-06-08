@@ -39,8 +39,12 @@ cd cc-gradient-statusline
 
 The installer copies `statusline.py` to `~/.local/bin/` and points your
 `~/.claude/settings.json` `statusLine` at it (backing up the old settings to
-`settings.json.bak`). Open a new Claude Code session to see it. To revert,
+`settings.json.bak`). It then **asks whether to also enable real-time date/time
+awareness** (see below). Open a new Claude Code session to see it. To revert,
 run `./uninstall.sh`.
+
+Non-interactive installs can pass `--with-time-hooks` / `--no-time-hooks`
+(or set `CC_INSTALL_TIME_HOOKS=1`) to answer that prompt up front.
 
 Manual install, if you prefer:
 
@@ -104,6 +108,24 @@ python3 statusline.py --demo --pct5 73 --pct7 41 --cols 40
 
 Gradient stops live in `STOPS_LIGHT` / `STOPS_DARK` near the top of the file —
 edit the RGB tuples to recolor.
+
+## Optional: real-time date/time for Claude
+
+The status line shows *you* the time, but the model never sees the status line.
+The installer can optionally add two hooks so **Claude itself** always knows the
+current date/time:
+
+- **`UserPromptSubmit`** (`hooks/inject-date.sh`) prints the date into context at
+  the start of every turn — fixes the stale "session start" date in long sessions.
+- **`PostToolUse`** (`hooks/inject-time.sh`) refreshes the time after tool calls
+  during long tasks, **throttled** to one injection per `CC_TIME_INTERVAL`
+  seconds (default 60) so context isn't flooded. The two share a throttle file,
+  so there's no redundant injection right after a prompt.
+
+This is opt-in — the installer asks, and skips it unless you say yes (or pass
+`--with-time-hooks`). The hooks merge into `settings.json` without disturbing any
+hooks you already have, and `./uninstall.sh` removes them. Tune the cadence with
+`CC_TIME_INTERVAL=<seconds>`.
 
 ## Verify / preview
 
