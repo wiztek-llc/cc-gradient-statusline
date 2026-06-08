@@ -76,6 +76,7 @@ if THEME == "light":
     SOFT = (124, 120, 116)     # ctx label, reset countdown
     TRACK = (181, 174, 162)    # empty bar cells — faint warm grey on cream
     SEPC = (200, 194, 182)
+    SAVED = (0, 150, 90)       # ledger tokens-saved — deep green, reads on cream
     BG_FILL = None
 else:  # "pill" and "dark" share the neon foreground palette
     TEXT = (230, 232, 242)
@@ -84,6 +85,7 @@ else:  # "pill" and "dark" share the neon foreground palette
     SOFT = (122, 124, 140)
     TRACK = (66, 70, 86)       # dim slate dots on the dark pill
     SEPC = (70, 74, 92)
+    SAVED = (0, 230, 150)      # ledger tokens-saved — mint, pops on the pill
     BG_FILL = (22, 23, 30) if THEME == "pill" else None  # the dark island
 
 RESET = "\033[0m"
@@ -428,6 +430,48 @@ def ctx_chip(payload):
     return fg(SOFT) + "ctx " + RESET + fg(c) + f"{round(used)}%" + RESET
 
 
+def _human(n):
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.0f}k"
+    return str(int(n))
+
+
+def _find_ledger_stats(start):
+    """Walk up from `start` to find a Context Ledger stats file for this project."""
+    try:
+        d = os.path.abspath(start)
+    except Exception:
+        return None
+    while True:
+        p = os.path.join(d, ".claude", "context-ledger.stats.json")
+        if os.path.isfile(p):
+            return p
+        nd = os.path.dirname(d)
+        if nd == d:
+            return None
+        d = nd
+
+
+def savings_chip(payload):
+    """Show cumulative context tokens saved by Context Ledger for this project."""
+    cwd = (payload.get("workspace", {}) or {}).get("current_dir") or payload.get("cwd")
+    if not cwd:
+        return ""
+    p = _find_ledger_stats(cwd)
+    if not p:
+        return ""
+    try:
+        saved = json.load(open(p)).get("saved_tokens", 0)
+    except Exception:
+        return ""
+    if saved <= 0:
+        return ""
+    return (fg(SAVED) + "⊟ " + _human(saved) + RESET
+            + fg(SOFT) + " ctx saved" + RESET)
+
+
 def meter(glyph, window, bar_w=BAR_W, cd_mode="full", show_label=True):
     """One gradient meter. Parametric so the layout can shed detail under width
     pressure: bar_w=0 drops the bar, cd_mode in full|short|none, show_label
@@ -453,7 +497,7 @@ def meter(glyph, window, bar_w=BAR_W, cd_mode="full", show_label=True):
 
 
 def render(payload, usage, model="full", ctx=True, bar_w=BAR_W,
-           cd="full", labels=True):
+           cd="full", labels=True, saved=True):
     """Render one layout variant given the detail flags."""
     sep = fg(SEPC) + "  " + RESET
     parts = []
@@ -465,6 +509,10 @@ def render(payload, usage, model="full", ctx=True, bar_w=BAR_W,
         cc = ctx_chip(payload)
         if cc:
             parts.append(cc)
+    if saved:
+        sc = savings_chip(payload)
+        if sc:
+            parts.append(sc)
     if usage:
         for glyph, key in (("5h", "five_hour"), ("7d", "seven_day")):
             m = meter(glyph, usage.get(key), bar_w, cd, labels)
@@ -479,14 +527,14 @@ def render(payload, usage, model="full", ctx=True, bar_w=BAR_W,
 # pane is used, so detail is shed in priority order (model name → ctx →
 # countdowns → bars → 5h/7d labels) and the percentages survive longest.
 TIERS = [
-    dict(model="full", ctx=True,  bar_w=12, cd="full",  labels=True),
-    dict(model="full", ctx=False, bar_w=12, cd="full",  labels=True),
-    dict(model="icon", ctx=False, bar_w=12, cd="full",  labels=True),
-    dict(model="icon", ctx=False, bar_w=10, cd="short", labels=True),
-    dict(model="none", ctx=False, bar_w=8,  cd="short", labels=True),
-    dict(model="none", ctx=False, bar_w=6,  cd="none",  labels=True),
-    dict(model="none", ctx=False, bar_w=0,  cd="none",  labels=True),
-    dict(model="none", ctx=False, bar_w=0,  cd="none",  labels=False),
+    dict(model="full", ctx=True,  bar_w=12, cd="full",  labels=True,  saved=True),
+    dict(model="full", ctx=False, bar_w=12, cd="full",  labels=True,  saved=True),
+    dict(model="icon", ctx=False, bar_w=12, cd="full",  labels=True,  saved=True),
+    dict(model="icon", ctx=False, bar_w=10, cd="short", labels=True,  saved=True),
+    dict(model="none", ctx=False, bar_w=8,  cd="short", labels=True,  saved=False),
+    dict(model="none", ctx=False, bar_w=6,  cd="none",  labels=True,  saved=False),
+    dict(model="none", ctx=False, bar_w=0,  cd="none",  labels=True,  saved=False),
+    dict(model="none", ctx=False, bar_w=0,  cd="none",  labels=False, saved=False),
 ]
 
 
